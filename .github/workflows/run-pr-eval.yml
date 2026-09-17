@@ -298,6 +298,7 @@ jobs:
           REQUESTED_SHA: ${{ needs.run-pr-eval.outputs.requested_sha }}
           EVAL_JOB_RESULT: ${{ needs.run-pr-eval.result }}
           ARTIFACT_AVAILABLE: ${{ steps.download.outcome == 'success' }}
+          OUTPUT_PATH: pr-eval-output/run-pr-eval-output.md
           EXIT_CODE_PATH: pr-eval-output/run-pr-eval-exit-code.txt
         with:
           script: |
@@ -319,6 +320,33 @@ jobs:
                 : process.env.EVAL_JOB_RESULT.toUpperCase();
             const runUrl = `${process.env.GITHUB_SERVER_URL}/${context.repo.owner}/${context.repo.repo}/actions/runs/${process.env.GITHUB_RUN_ID}`;
             const artifactAvailable = process.env.ARTIFACT_AVAILABLE === "true";
+            const outputPath = process.env.OUTPUT_PATH;
+            let report = "";
+
+            if (artifactAvailable && fs.existsSync(outputPath)) {
+              const output = fs.readFileSync(outputPath, "utf8");
+              const startMarker = "######## REPORT START ########";
+              const endMarker = "######## REPORT END ########";
+              const escapedStart = startMarker.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+              const escapedEnd = endMarker.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+              const reportPattern = new RegExp(
+                `${escapedStart}\\s*([\\s\\S]*?)\\s*${escapedEnd}`,
+                "g"
+              );
+              const reportBlocks = [...output.matchAll(reportPattern)]
+                .map((match) => match[1].trim())
+                .filter(Boolean);
+
+              report = reportBlocks.length > 0
+                ? reportBlocks.join("\n\n")
+                : "No report section found between REPORT START and REPORT END markers.";
+            } else {
+              report = "No evaluation output artifact was available.";
+            }
+
+            if (report.length > 58000) {
+              report = `${report.slice(0, 58000)}\n\n...output truncated; see workflow artifact for full output...`;
+            }
 
             const body = [
               "## PR Evaluation",
@@ -331,9 +359,7 @@ jobs:
                 ? `- Full output: [workflow artifact](${runUrl})`
                 : "- Full output: no artifact was produced",
               "",
-              artifactAvailable
-                ? "Evaluation logs are attached to the workflow run artifact. This comment intentionally avoids rendering PR-controlled report markdown directly."
-                : "The evaluation did not produce an output artifact. Check the workflow run for validation or setup failures.",
+              report,
             ].join("\n");
 
             await github.rest.issues.createComment({
