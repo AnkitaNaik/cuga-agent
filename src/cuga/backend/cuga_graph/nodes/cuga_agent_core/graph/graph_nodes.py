@@ -22,6 +22,13 @@ from langgraph.types import Command
 from loguru import logger
 from cuga.backend.cuga_graph.utils.harmony import strip_harmony_tokens
 
+EMPTY_RESPONSE_CORRECTION_KEY = "_empty_response_correction"
+EMPTY_RESPONSE_CORRECTION = (
+    "Your last reply was empty. Continue the task: either emit the next code "
+    "block, or state the final answer."
+)
+STEP_LIMIT_MESSAGE_PREFIX = "Maximum step limit ("
+
 
 class CoreGraphAdapter(ABC):
     """Graph-specific seam for the shared loop helpers.
@@ -171,20 +178,24 @@ class CoreGraphAdapter(ABC):
         """Return the *value* (not the full key/value pair) for the metadata
         state key after a call_model response.
 
-        Default adds ``playbook_guidance_added: True`` when a playbook fired;
-        Lite overrides to also run ``_clean_empty_response_retry_meta``.
+        Clears the one-shot empty-reply marker so a later empty reply can
+        retry again. Adds ``playbook_guidance_added: True`` when a playbook
+        fired.
         """
-        meta = self.get_metadata(state)
+        meta = dict(self.get_metadata(state) or {})
+        meta.pop(EMPTY_RESPONSE_CORRECTION_KEY, None)
         if playbook_fired:
-            return {**meta, "playbook_guidance_added": True}
+            meta["playbook_guidance_added"] = True
         return meta
 
     async def classify_auto_continue(
         self, state: Any, model: Any, content: str, reasoning: Optional[str]
-    ) -> bool:
+    ) -> bool | str:
         """Return ``True`` when the NL response should loop back automatically.
-        Default: ``False`` (Supervisor never auto-continues).
-        Lite overrides with ``classify_nl_auto_continue``."""
+        A truthy ``str`` also loops back, but is used verbatim as the synthetic
+        user message instead of the plain ``"continue"`` (Lite's unverified-
+        blocker retry, issue #610). Default: ``False`` (Supervisor never
+        auto-continues). Lite overrides with ``classify_nl_auto_continue_decision``."""
         return False
 
 
@@ -205,7 +216,7 @@ def append_chat_messages_with_step_limit(
 
     if new_step_count > limit:
         error_msg = (
-            f"Maximum step limit ({limit}) reached. "
+            f"{STEP_LIMIT_MESSAGE_PREFIX}{limit}) reached. "
             f"The task has exceeded the allowed number of execution cycles. "
             f"Please simplify your request or break it into smaller tasks."
         )
@@ -217,9 +228,35 @@ def append_chat_messages_with_step_limit(
     return base + new_messages, None
 
 
+# Prefix of every execution-feedback HumanMessage. Consumers that *detect*
+# execution history by matching message text (Lite's blocked-claim evidence,
+# the reasoning-only finalize fallback, reflection task extraction) must use
+# this constant so they cannot drift from the producer below.
+EXECUTION_OUTPUT_PREFIX = "Execution output:"
+
+
 def execution_output_text(output: str) -> str:
     """The execution-feedback message body shared by both execute nodes."""
-    return f"Execution output:\n{output}"
+    return f"{EXECUTION_OUTPUT_PREFIX}\n{output}"
+
+
+def sandbox_step_execution_output(messages: Any) -> str:
+    """Output of this sandbox step only. Do not reuse an older Execution output: message."""
+    if not messages:
+        return ""
+    for msg in reversed(messages):
+        content = msg.get("content", "") if isinstance(msg, dict) else getattr(msg, "content", None)
+        if not isinstance(content, str):
+            return ""
+        if content.startswith(EXECUTION_OUTPUT_PREFIX):
+            # Strip only the leading marker: splitting on every occurrence
+            # discarded everything before the last one when the sandbox output
+            # itself contained the literal "Execution output:" sequence.
+            return content[len(EXECUTION_OUTPUT_PREFIX) :].lstrip("\n")
+        if content.startswith(STEP_LIMIT_MESSAGE_PREFIX):
+            continue
+        return ""
+    return ""
 
 
 def enforce_step_limit(
@@ -242,7 +279,7 @@ def enforce_step_limit(
     """
     if new_step_count > limit:
         error_msg = (
-            f"Maximum step limit ({limit}) reached. "
+            f"{STEP_LIMIT_MESSAGE_PREFIX}{limit}) reached. "
             f"The task has exceeded the allowed number of execution cycles. "
             f"Please simplify your request or break it into smaller tasks."
         )

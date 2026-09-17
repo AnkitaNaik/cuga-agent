@@ -22,6 +22,7 @@ from rich.text import Text
 from cuga.config import PACKAGE_ROOT, TRAJECTORY_DATA_DIR, get_user_data_path, settings
 from cuga.configurations.instructions_manager import InstructionsManager
 from cuga.backend.cuga_graph.policy.cli import app as policy_app
+from cuga.cli.purge_cmds import purge_app
 from cuga.backend.server.demo_manage_setup import (
     build_tools_from_apps,
     get_default_apps_for_preset,
@@ -186,6 +187,7 @@ app = typer.Typer(
 )
 
 app.add_typer(policy_app, name="policy")
+app.add_typer(purge_app, name="purge")
 # ``cuga knowledge`` lives in its own module per Sami review
 # (cli/main.py was overloaded). ``knowledge_app`` is imported at the
 # top alongside the other ``cuga.*`` modules; the wire here mirrors
@@ -684,6 +686,7 @@ def _start_demo_crm_services(
         # Configure supervisor mode
         if enable_supervisor:
             os.environ["DYNACONF_SUPERVISOR__ENABLED"] = "true"
+            os.environ["DYNACONF_SUPERVISOR__REGISTRY_ENABLED"] = "true"
             supervisor_config_path = os.path.join(
                 PACKAGE_ROOT, "backend", "tools_env", "registry", "config", "supervisor_demo_crm.yaml"
             )
@@ -914,6 +917,11 @@ def start(
         False,
         "--oak-health",
         help="Enable healthcare insurance OpenAPI (cuga-oak-health; port from settings server_ports.oak_health_api)",
+    ),
+    seed_supervisor_demo: bool = typer.Option(
+        False,
+        "--seed-supervisor-demo",
+        help="For manager: preload 3 sub-agents + 1 supervisor (draft + published) so the multi-agent flow is immediately testable in the UI",
     ),
     reset: bool = typer.Option(
         False,
@@ -1241,6 +1249,17 @@ def start(
     app_crm, app_email, app_digital_sales, app_docs, app_filesystem, app_oak_health = _resolve_apps(
         service, crm, email, digital_sales, docs, filesystem, no_email, oak_health
     )
+    if seed_supervisor_demo and service != "manager":
+        logger.warning("--seed-supervisor-demo is only applied for service=manager; ignoring")
+    # The supervisor demo's sub-agents are CRM / email / filesystem specialists, so force those
+    # services on and enable runtime filesystem tools — otherwise delegation lands on agents
+    # whose tools were never provisioned (issue #101).
+    if seed_supervisor_demo and service == "manager":
+        app_crm = True
+        app_email = True
+        app_filesystem = True
+        os.environ["DYNACONF_ADVANCED_FEATURES__ENABLE_FILESYSTEM_TOOLS"] = "true"
+        os.environ["DYNACONF_SUPERVISOR__REGISTRY_ENABLED"] = "true"
     resolved_tools = build_tools_from_apps(
         crm=app_crm,
         email=app_email,
@@ -1258,7 +1277,12 @@ def start(
             os.environ["MCP_SERVERS_FILE"] = "none"
             _apply_local_demo_workspace_env()
             logger.info(f"Manager mode: policy filesystem sync disabled, MCP_SERVERS_FILE={managed_path}")
-            setup_demo_manage_config("manager", tools=resolved_tools, filesystem=app_filesystem)
+            setup_demo_manage_config(
+                "manager",
+                tools=resolved_tools,
+                filesystem=app_filesystem,
+                seed_supervisor_demo=seed_supervisor_demo,
+            )
 
             app_mgr = _make_app_manager()
             workspace_path = cuga_workspace or os.path.join(os.getcwd(), "cuga_workspace")
@@ -1343,7 +1367,10 @@ def start(
         os.environ["CUGA_DEMO_ADVANCED"] = "true"
         os.environ["CUGA_MANAGER_MODE"] = "true"
         os.environ["DYNACONF_POLICY__FILESYSTEM_SYNC"] = "false"
-        os.environ["MCP_SERVERS_FILE"] = "none"
+        # An operator who exports MCP_SERVERS_FILE means it — don't overwrite it. Unset still means
+        # "none" (managed-config-db mode, serving the demo app), which is what the demo wants.
+        if not (os.environ.get("MCP_SERVERS_FILE", "") or "").strip():
+            os.environ["MCP_SERVERS_FILE"] = "none"
         ensure_managed_mcp_file_exists(get_managed_mcp_path())
 
         try:

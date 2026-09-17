@@ -47,12 +47,14 @@ class SupervisorGraphAdapter(CoreGraphAdapter):
         tool_provider: Optional[Any] = None,
         base_callbacks: Optional[List[Any]] = None,
         static_prompt: Optional[str] = None,
+        plan_approval: bool = False,
     ) -> None:
         self._agents = agents
         self._special_instructions = special_instructions
         self._tool_provider = tool_provider
         self._base_callbacks = base_callbacks or []
         self._static_prompt = static_prompt
+        self._plan_approval = plan_approval
         self._agent_tools_context: Dict[str, Any] = {}
 
     def get_messages(self, state: Any) -> List[BaseMessage]:
@@ -88,12 +90,6 @@ class SupervisorGraphAdapter(CoreGraphAdapter):
     async def ainvoke_model(self, bound: Any, messages: list, invoke_config: dict) -> Any:
         clamp_watsonx_completion_for_messages(bound, messages)
         return await bound.ainvoke(messages, config=invoke_config)
-
-    def build_metadata_update(self, state: Any, *, playbook_fired: bool) -> dict:
-        meta = dict(self.get_metadata(state))
-        if playbook_fired:
-            return {**meta, "playbook_guidance_added": True}
-        return meta
 
     def record_delegation(
         self,

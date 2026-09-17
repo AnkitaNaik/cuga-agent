@@ -33,6 +33,9 @@ from cuga.backend.cuga_graph.nodes.cuga_agent_core.execution.code_extraction imp
     extract_code_from_model_response,
 )
 from cuga.backend.cuga_graph.nodes.cuga_agent_core.graph.graph_nodes import (
+    EMPTY_RESPONSE_CORRECTION,
+    EMPTY_RESPONSE_CORRECTION_KEY,
+    EXECUTION_OUTPUT_PREFIX,
     CoreGraphAdapter,
     enforce_step_limit,
 )
@@ -293,17 +296,67 @@ def create_call_model_node(
                 },
             )
 
+        # ── Empty reply: retry once before finalizing ──────────────────────
+        # A reply with neither visible content nor reasoning carries no answer
+        # and no continuation signal — the model simply returned nothing. Ending
+        # the turn here delivers whatever happens to be left over (the previous
+        # execution output, or "No answer found"). Ask once for a real reply.
+        #
+        # This sits ahead of classify_auto_continue deliberately: an empty reply
+        # is a transport anomaly, not a continuation judgement, so it must not be
+        # gated behind the NL auto-continue feature flag.
+        #
+        # Reasoning counts as content. A reply with empty visible text but real
+        # reasoning is finalized from the reasoning below, and retrying it would
+        # discard a usable answer.
+        both_blank = not (content or "").strip() and not (reasoning or "").strip()
+        already_retried = bool(adapter.get_metadata(state).get(EMPTY_RESPONSE_CORRECTION_KEY))
+        # A retry costs a step. On the last allowed one it would route to
+        # call_model only to trip the step limit there, replacing whatever
+        # answer we could still give with the limit message.
+        step_remains = new_step_count < max_steps
+        if both_blank and not already_retried and not budget_exhausted and step_remains:
+            logger.warning(
+                f"{adapter.sender_name}: model returned an empty reply "
+                "(no content, no reasoning) — retrying once"
+            )
+            retry_meta = dict(adapter.build_metadata_update(state, playbook_fired=playbook_fired) or {})
+            # build_metadata_update clears this key every turn, so set it after:
+            # the marker survives exactly one turn and the retry cannot repeat.
+            retry_meta[EMPTY_RESPONSE_CORRECTION_KEY] = True
+            return Command(
+                goto="call_model",
+                update={
+                    adapter.messages_key: final_messages + [HumanMessage(content=EMPTY_RESPONSE_CORRECTION)],
+                    "script": None,
+                    "final_answer": "",
+                    "execution_complete": False,
+                    "step_count": new_step_count,
+                    adapter.metadata_key: retry_meta,
+                },
+            )
+
         should_continue = (
             False
             if budget_exhausted
             else await adapter.classify_auto_continue(state, active_model, content, reasoning)
         )
         if should_continue:
+            # A str result is a corrective directive (e.g. Lite's unverified-blocker
+            # retry, issue #610) — use it as the synthetic user message.
+            continue_text = should_continue if isinstance(should_continue, str) else "continue"
+            # Rebuild metadata unconditionally: classify_auto_continue may mutate
+            # state (Lite's spent-retry marker), and the meta_update above was
+            # snapshotted before the classify call. build_metadata_update re-reads
+            # state, so this is a no-op when nothing changed.
+            meta_update = {
+                adapter.metadata_key: adapter.build_metadata_update(state, playbook_fired=playbook_fired)
+            }
             logger.info(f"{adapter.sender_name}: NL response classified as interim — auto-continuing")
             return Command(
                 goto="call_model",
                 update={
-                    adapter.messages_key: final_messages + [HumanMessage(content="continue")],
+                    adapter.messages_key: final_messages + [HumanMessage(content=continue_text)],
                     "script": None,
                     "final_answer": "",
                     "execution_complete": False,
@@ -322,7 +375,7 @@ def create_call_model_node(
             if not contains_harmony_tokens(candidate):
                 final_answer = candidate
         if not (final_answer or "").strip():
-            exec_prefix = "Execution output:\n"
+            exec_prefix = EXECUTION_OUTPUT_PREFIX + "\n"
             for msg in reversed(modified_messages):
                 if isinstance(msg, HumanMessage):
                     text = msg.content or ""

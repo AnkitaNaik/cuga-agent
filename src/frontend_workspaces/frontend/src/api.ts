@@ -4,10 +4,14 @@
 
 export function getApiBaseUrl(): string {
   if (typeof window === "undefined") return "http://localhost:7860";
-  const { hostname, protocol, origin, port } = window.location;
-  if (hostname !== "localhost" && hostname !== "127.0.0.1") return origin;
-  if (port === "3002") return origin;
-  return `${protocol}//${hostname}:7860`;
+  const { origin, protocol } = window.location;
+  // The SPA is served BY the FastAPI backend, so the API lives at the SAME origin — on whatever
+  // port served this page: 7860, 8100, the :3002 webpack dev server (which proxies /api → backend),
+  // or a production domain. This must NOT hardcode a port, or a CUGA server on any non-7860 port
+  // (e.g. the events server on :8100) has its API calls silently sent to :7860 instead.
+  // Only fall back to the default CUGA port for non-web origins (electron file://), which have none.
+  if (protocol === "http:" || protocol === "https:") return origin;
+  return "http://localhost:7860";
 }
 
 let authConfigCache: { enabled: boolean; authorization_enabled: boolean } | null = null;
@@ -24,9 +28,15 @@ export async function getAuthConfig(): Promise<{ enabled: boolean; authorization
   return authConfigCache;
 }
 
-let uiConfigCache: { hide_cuga_logo: boolean; brand_name: string } | null = null;
+export type UiConfig = {
+  hide_cuga_logo: boolean;
+  brand_name: string;
+  agent_registry: boolean;
+};
 
-export async function getUiConfig(): Promise<{ hide_cuga_logo: boolean; brand_name: string }> {
+let uiConfigCache: UiConfig | null = null;
+
+export async function getUiConfig(): Promise<UiConfig> {
   if (uiConfigCache !== null) return uiConfigCache;
   const base = getApiBaseUrl();
   const res = await fetch(`${base}/api/ui/config`, { credentials: "include" });
@@ -34,8 +44,66 @@ export async function getUiConfig(): Promise<{ hide_cuga_logo: boolean; brand_na
   uiConfigCache = {
     hide_cuga_logo: !!data.hide_cuga_logo,
     brand_name: data.brand_name && String(data.brand_name).trim() ? String(data.brand_name).trim() : "CUGA Agent",
+    agent_registry: !!data.agent_registry,
   };
   return uiConfigCache;
+}
+
+// ── the eventing layer's origin ───────────────────────────────────────────────────────────────
+// EVENTS_API_URL unset: nothing to redirect to, so this resolves to same-origin — which is also
+// the safe fallback when /api/ui/config cannot be read. SPLIT deployment: the UI is served by cuga-core
+// while /api/events/*, /api/concierge and /invoke live on the events service, so those calls must
+// be sent there. The server tells us where via /api/ui/config (EVENTS_API_URL); resolved once and
+// cached, and any failure falls back to same-origin rather than breaking the page.
+const EVENTS_PATHS = ["/api/events", "/api/concierge", "/invoke"];
+// ...EXCEPT the admin endpoints. Those now require the gateway token on the eventing service
+// (they used to accept a caller-asserted identity, so an unauthenticated POST could create an
+// admin). A browser cannot hold that secret, so these go to CUGA instead, which attaches the
+// token and forwards — behind the same auth that protects the Manage UI. Routing them to the
+// events origin directly would simply 401.
+const CORE_ONLY_PATHS = ["/api/events/admin"];
+let eventsBaseCache: string | null = null;
+let eventsBaseInFlight: Promise<string> | null = null;
+
+// Resolution lives HERE, with the cache it mutates and the `apiFetch` that calls it, because it is
+// routing rather than an events endpoint: it answers "which origin does this path go to". Moving it
+// into ./events/api.ts once separated it from `eventsBaseCache`/`eventsBaseInFlight` above, leaving
+// an undefined identifier on both sides of the split — silent, because every caller wraps this in a
+// catch, so the only symptom was that events UI quietly stopped existing.
+export async function getEventsBaseUrl(): Promise<string> {
+  if (eventsBaseCache !== null) return eventsBaseCache;
+  if (!eventsBaseInFlight) {
+    eventsBaseInFlight = fetch(`${getApiBaseUrl()}/api/ui/config`, { credentials: "include" })
+      .then((r): Promise<Record<string, unknown>> => (r.ok ? r.json() : Promise.resolve({})))
+      .then((c): string => {
+        const configured = String(c?.events_api_url ?? "").replace(/\/$/, "");
+        const resolved = configured || getApiBaseUrl();
+        eventsBaseCache = resolved;
+        return resolved;
+      })
+      .catch((): string => {
+        const resolved = getApiBaseUrl();
+        eventsBaseCache = resolved;
+        return resolved;
+      });
+  }
+  return eventsBaseInFlight;
+}
+
+/** The resolved events origin, SYNCHRONOUSLY, for the few places that cannot await.
+ *
+ * `window.open(...)` must be called inside the click handler's user-gesture window; awaiting first
+ * hands the browser an un-gestured `open()` and Safari and Firefox block it. So the connect link
+ * reads the already-resolved cache instead — populated by the first `apiFetch` to an events path,
+ * which the Studio always issues before a Connect button can be on screen.
+ *
+ * Cold cache falls back to same-origin, which is exactly the old behaviour, and kicks off the
+ * resolution so a second attempt is right.
+ */
+export function eventsBaseUrlSync(): string {
+  if (eventsBaseCache !== null) return eventsBaseCache;
+  void getEventsBaseUrl();
+  return getApiBaseUrl();
 }
 
 export async function apiFetch(
@@ -43,7 +111,12 @@ export async function apiFetch(
   init?: RequestInit
 ): Promise<Response> {
   const base = getApiBaseUrl();
-  const fullUrl = typeof url === "string" && !url.startsWith("http") ? `${base}${url.startsWith("/") ? "" : "/"}${url}` : url;
+  const isEvents =
+    typeof url === "string" &&
+    EVENTS_PATHS.some((p) => url.startsWith(p)) &&
+    !CORE_ONLY_PATHS.some((p) => url.startsWith(p));
+  const callBase = isEvents ? await getEventsBaseUrl() : base;
+  const fullUrl = typeof url === "string" && !url.startsWith("http") ? `${callBase}${url.startsWith("/") ? "" : "/"}${url}` : url;
   const res = await fetch(fullUrl, {
     ...init,
     credentials: "include",
@@ -105,12 +178,13 @@ export async function postStream(
     useDraft?: boolean;
     disableHistory?: boolean;
     signal?: AbortSignal;
+    agentId?: string;
   }
 ): Promise<Response> {
-  const base = getApiBaseUrl();
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
     "X-Thread-ID": options.threadId,
+    "X-Agent-ID": options.agentId || getKnowledgeAgentId(),
   };
   if (options.useDraft) headers["X-Use-Draft"] = "true";
   if (options.disableHistory) headers["X-Disable-History"] = "true";
@@ -122,15 +196,15 @@ export async function postStream(
   });
 }
 
-export async function getConversationStreamEvents(threadId: string): Promise<Response> {
+export async function getConversationStreamEvents(threadId: string, agentId?: string): Promise<Response> {
   return apiFetch(
-    `/api/conversation-stream-events/${threadId}?agent_id=cuga-default&user_id=default_user`
+    `/api/conversation-stream-events/${threadId}?agent_id=${encodeURIComponent(agentId || getKnowledgeAgentId())}&user_id=default_user`
   );
 }
 
-export async function getConversationMessages(threadId: string): Promise<Response> {
+export async function getConversationMessages(threadId: string, agentId?: string): Promise<Response> {
   return apiFetch(
-    `/api/conversation-messages/${threadId}?agent_id=cuga-default&user_id=default_user`
+    `/api/conversation-messages/${threadId}?agent_id=${encodeURIComponent(agentId || getKnowledgeAgentId())}&user_id=default_user`
   );
 }
 
@@ -187,7 +261,7 @@ export async function postManageConfigDraft(
 // ``fetch``'s second arg, so passing ``signal`` here propagates
 // natively. See CLIENT_CANCELLATION_CONTRACT.md for the contract.
 export async function patchManageConfigDraftAgent(
-  agent: { name?: string; description?: string },
+  agent: { name?: string; description?: string; kind?: "single" | "supervisor" },
   agentId?: string,
   signal?: AbortSignal,
 ): Promise<Response> {
@@ -238,6 +312,21 @@ export async function patchManageConfigDraftPolicies(
     method: "PATCH",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ policies }),
+    signal,
+  });
+}
+
+export async function patchManageConfigDraftSupervisor(
+  supervisor: unknown,
+  agentId?: string,
+  signal?: AbortSignal,
+  saveSeq?: number,
+): Promise<Response> {
+  const q = agentId ? `?agent_id=${encodeURIComponent(agentId)}` : "";
+  return apiFetch(`/api/manage/config/draft/supervisor${q}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ supervisor, ...(saveSeq != null ? { saveSeq } : {}) }),
     signal,
   });
 }
@@ -316,16 +405,16 @@ export async function getSkills(): Promise<Response> {
   return apiFetch("/api/skills");
 }
 
-export async function getConversationThreads(): Promise<Response> {
-  return apiFetch("/api/conversation-threads?agent_id=cuga-default");
+export async function getConversationThreads(agentId?: string): Promise<Response> {
+  return apiFetch(`/api/conversation-threads?agent_id=${encodeURIComponent(agentId || getKnowledgeAgentId())}`);
 }
 
 export async function getConversations(): Promise<Response> {
   return apiFetch("/api/conversations");
 }
 
-export async function deleteConversation(threadId: string): Promise<Response> {
-  return apiFetch(`/api/conversations/${threadId}?agent_id=cuga-default`, {
+export async function deleteConversation(threadId: string, agentId?: string): Promise<Response> {
+  return apiFetch(`/api/conversations/${threadId}?agent_id=${encodeURIComponent(agentId || getKnowledgeAgentId())}`, {
     method: "DELETE",
   });
 }
@@ -387,6 +476,22 @@ export async function getAgents(): Promise<Response> {
   return apiFetch("/api/agents");
 }
 
+export async function createAgent(
+  name: string,
+  description: string,
+  kind: "single" | "supervisor"
+): Promise<Response> {
+  return apiFetch("/api/agents", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name, description, kind }),
+  });
+}
+
+export async function deleteAgent(agentId: string): Promise<Response> {
+  return apiFetch(`/api/agents/${encodeURIComponent(agentId)}`, { method: "DELETE" });
+}
+
 export async function getSecrets(agentId?: string): Promise<Response> {
   const q = agentId ? `?agent_id=${encodeURIComponent(agentId)}` : "";
   return apiFetch(`/api/secrets${q}`);
@@ -433,8 +538,10 @@ export async function deleteSecret(id: string): Promise<Response> {
 // Knowledge API (unified — LangChain + Milvus Lite engine)
 // ---------------------------------------------------------------------------
 
-// Current agent context — set by the app when agent is selected
-let _knowledgeAgentId = "default";
+// Current agent context — set by the app when agent is selected. Also used by postStream /
+// conversation endpoints as the X-Agent-ID / agent_id fallback (issue #101) so calls made
+// before the async agent-context fetch resolves still target the real default agent.
+let _knowledgeAgentId = "cuga-default";
 export function setKnowledgeAgentId(agentId: string) {
   _knowledgeAgentId = agentId;
 }
@@ -674,3 +781,10 @@ export function deleteSessionKnowledgeCollection(
     method: "DELETE",
   }, threadId);
 }
+
+// ── the events layer's HTTP surface ────────────────────────────────────────────────────────────
+// Defined in ./events/api.ts and re-exported here so callers outside the events UI (App, the chat
+// landing page, the Manage pages — all of which ask `getEventsStatus()` whether to show a Studio
+// link) keep importing from one place. Delete the events layer and this block goes with it; nothing
+// above this line knows the events service exists.
+export * from "./events/api";
