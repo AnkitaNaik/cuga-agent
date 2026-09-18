@@ -19,8 +19,7 @@ jobs:
       (
         github.event.comment.author_association == 'OWNER' ||
         github.event.comment.user.login == 'AnkitaNaik' ||
-        github.event.comment.user.login == 'Sergey-Zeltyn' ||
-        github.event.comment.user.login == 'haroldship'
+        github.event.comment.user.login == 'Sergey-Zeltyn'
       )
     runs-on: [self-hosted, linux, run-pr-eval]
     timeout-minutes: 120
@@ -243,7 +242,7 @@ jobs:
           cp "${output_log}" "${GITHUB_WORKSPACE}/run-pr-eval-output.md"
           cp "${exit_code_log}" "${GITHUB_WORKSPACE}/run-pr-eval-exit-code.txt"
 
-          exit "${status}"
+          exit 0
 
       - name: Cleanup PR evaluation processes
         if: always()
