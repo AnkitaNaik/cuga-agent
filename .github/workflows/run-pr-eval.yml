@@ -238,7 +238,13 @@ jobs:
 
           redact_file "${output_log}"
           redact_file "${exit_code_log}"
-          bash "${eval_script}" --extract-report "${output_log}" "${report_log}"
+          if ! bash "${eval_script}" --extract-report "${output_log}" "${report_log}" || [[ ! -f "${report_log}" ]]; then
+            {
+              echo "No parsed evaluation report was produced."
+              echo
+              echo "See the workflow artifact for the full evaluation output."
+            } > "${report_log}"
+          fi
           redact_file "${report_log}"
 
           echo "Saved output log: ${output_log}"
@@ -320,20 +326,31 @@ jobs:
             const exitCode = fs.existsSync(exitCodePath)
               ? fs.readFileSync(exitCodePath, "utf8").trim()
               : "unknown";
-            const result = exitCode === "0"
-              ? "SUCCESS"
-              : process.env.EVAL_JOB_RESULT === "failure"
-                ? `FAILED (${exitCode})`
-                : process.env.EVAL_JOB_RESULT.toUpperCase();
             const runUrl = `${process.env.GITHUB_SERVER_URL}/${context.repo.owner}/${context.repo.repo}/actions/runs/${process.env.GITHUB_RUN_ID}`;
             const artifactAvailable = process.env.ARTIFACT_AVAILABLE === "true";
             const reportPath = process.env.REPORT_PATH;
             let report = "";
+            let reportAvailable = false;
 
             if (artifactAvailable && fs.existsSync(reportPath)) {
               report = fs.readFileSync(reportPath, "utf8").trim();
+              reportAvailable = report.length > 0;
             } else {
               report = "No parsed evaluation report artifact was available.";
+            }
+
+            const evalJobResult = String(process.env.EVAL_JOB_RESULT || "unknown").toLowerCase();
+            let result = "UNKNOWN";
+            if (evalJobResult !== "success") {
+              result = exitCode === "unknown"
+                ? evalJobResult.toUpperCase()
+                : `FAILED (${exitCode})`;
+            } else if (exitCode !== "0") {
+              result = `FAILED (${exitCode})`;
+            } else if (!reportAvailable) {
+              result = "FAILED (report unavailable)";
+            } else {
+              result = "SUCCESS";
             }
 
             if (report.length > 58000) {
